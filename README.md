@@ -44,7 +44,7 @@ A secondary objective is also to achieve the above without relying on global sta
 ```clojure
 (def *db-atom (atom 0))
 
-(def drv-spec
+/def drv-spec
   {;; a source with no dependencies
    :db     [[]         *db-atom]
    ;; a derivative with a dependency
@@ -76,6 +76,96 @@ In a Rum component tree you might use *derivatives* as follows (assuming `*db-at
 ```
 
 The `rum-derivatives` mixin adds two functions to the React context of all child components: one to get a *derivative* and one to release it. The `drv` mixin adds hooks to your components that do exactly that and allow you to access the derivatives via component state. 
+
+
+
+### Use in combination with [citrus]
+
+If you use citrus and follows its convention to pass around the reconciler to
+every component, it is possible to keep a derivatives pool inside of this
+reconciler and use it from there.
+
+
+Make sure you include the pool when creating the reconciler:
+
+```cljs
+(rum/defc app [spec]
+  [:div
+   [:button {:on-click #(swap! *db-atom inc)} "inc"]
+   (derived-view)])
+
+(citrus/reconciler {:state {:derivatives-pool (d/derivatives-pool drv-spec)
+                            ...}
+                    :controllers ...})
+```
+
+Define the following helper functions and mixin:
+
+```cljs
+(defn component-with-reconciler?
+  "Returns true if the first argument to the rum component is a reconciler instance."
+  [rum-state]
+  (instance? citrus.reconciler/Reconciler
+             (-> rum-state :rum/args first)))
+
+(def ^:dynamic *derivation-token*)
+(def ^:dynamic *active-derivations*)
+
+(defn get-from-pool! [reconciler key]
+  (assert (instance? citrus.reconciler/Reconciler reconciler))
+  (assert *active-derivations* "sub is only suppported in conjunction with with-sub mixin")
+  (vswap! *active-derivations* conj key)
+  (d/get! (:derivatives-pool @reconciler) key *derivation-token*))
+
+(defn sub [reconciler subscription]
+  (rum/react (get-from-pool! reconciler subscription)))
+
+(defn release-from-pool! [reconciler key derivation-token]
+  (d/release! (:derivatives-pool @reconciler) key derivation-token))
+
+(def with-sub
+  "Mixin. Implements `rum.core/reactive` and adds the subscriptions to
+  derivatives from a pool that is available at :derivatives-pool in a citrus
+  reconciler, passed as the first prop to the component."
+  {:init
+   (fn [rum-state props]
+     (assert (component-with-reconciler? rum-state))
+     (assoc rum-state :rum.reactive/key    (random-uuid)
+                      ::derivation-token   (random-uuid)
+                      ::active-derivations #{}))
+   :wrap-render
+   (fn [render-fn]
+     (fn [{::keys [derivation-token] :as rum-state}]
+       (binding [*derivation-token*   derivation-token
+                 *active-derivations* (volatile! #{})]
+         (let [[dom intermediary-state] (((:wrap-render rum.core/reactive) render-fn) rum-state)
+               old-derivations (::active-derivations intermediary-state)
+               new-derivations @*active-derivations*]
+           (doseq [key old-derivations]
+             (when-not (contains? new-derivations key)
+               (release-from-pool! (-> intermediary-state :rum/args first) key derivation-token)))
+           [dom (assoc intermediary-state ::active-derivations new-derivations)]))))
+   :will-unmount
+   (fn [{::keys [derivation-token] :as rum-state}]
+     (doseq [ref (:rum.reactive/refs rum-state)]
+       (remove-watch ref key))
+     (doseq [key (::active-derivations rum-state)]
+       (release-from-pool! (-> rum-state :rum/args first) key derivation-token))
+     (dissoc rum-state :rum.reactive/refs :rum.reactive/key))})
+```
+
+Then use it in your components:
+
+```
+(rum/defc derived-view < with-sub
+  [r]
+  [:div
+   [:p ":inc "    (-> (sub r :inc) pr-str)]
+   [:p ":as-map " (-> (sub r :as-map) pr-str)]])
+```
+
+Note that the mixin above already includes the features of the `rum/reactive` mixin, and that the `sub` functions already derefs the value inside the derived atom.
+
 
 ## Comparisons
 
